@@ -147,6 +147,17 @@ def parse_tx(tx, mint, infra=frozenset(), dust_lamports=5_000):
         else:
             kind = "TRANSFER_OUT"
         counterparties = [o for o, d in tok.items() if o != owner and (d > 0) != (dtok > 0)]
+        priced_by_pool = False
+        dsol_actual = dsol
+        # Swap contre un pool sans SOL visible côté wallet (payé en USDC, routeur,
+        # compte intermédiaire) : valorisé au prix d'exécution côté pool.
+        # (sauf si un autre signataire a payé : bundle multi-wallets, le coût reste au payeur)
+        other_signer_paid = any(a in signer_set and a != owner and d < -10_000_000 for a, d in sol_payers.items())
+        if kind in ("TRANSFER_IN", "TRANSFER_OUT", "BUY_PAID_BY_OTHER") and pool_price \
+                and any(c in infra for c in counterparties) and not other_signer_paid:
+            kind = "BUY" if dtok > 0 else "SELL"
+            dsol = dsol_ex_fee = int(-pool_price * dtok)
+            priced_by_pool = True
         events.append({
             "signature": tx["transaction"]["signatures"][0],
             "slot": tx.get("slot"),
@@ -155,7 +166,9 @@ def parse_tx(tx, mint, infra=frozenset(), dust_lamports=5_000):
             "kind": kind,
             "token_raw": dtok,
             "decimals": decimals,
-            "sol_lamports": dsol,               # flux réel (frais réseau inclus si payeur)
+            "sol_lamports": dsol,               # flux réel (frais réseau inclus si payeur), ou valorisé pool
+            "sol_lamports_actual": dsol_actual,
+            "priced_by_pool": priced_by_pool,
             "sol_lamports_ex_fee": dsol_ex_fee,
             "is_signer": owner in signer_set,
             "fee_payer": fee_payer,

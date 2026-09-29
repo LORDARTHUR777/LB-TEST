@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from parse import LAMPORTS, WSOL, instruction_names, parse_tx, sol_deltas_by_owner, sol_transfers, token_deltas  # noqa: E402
 from rpc import Rpc  # noqa: E402
 
+ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 JEANPHIL_MINT = "GTBxUiw6wJdmmkCGZgRHLyYxqu1vG4KtRpeox6yDpump"
 JEANPHIL_CREATOR = "BS3FxZoEnDjt76iR3WhEkQZhLqLARVCDFu4dc4Z9dE3B"
 PUMP = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -48,10 +49,13 @@ def b58(s):
 
 
 class Investigation:
-    def __init__(self, rpc, mint, creator, out, snapshot_min=38, max_tx=None, wallet_scan_limit=3000, exclude=()):
+    def __init__(self, rpc, mint, creator, out, snapshot_min=38, max_tx=None, wallet_scan_limit=3000, exclude=(), window_min=60, jsonl=()):
         self.rpc, self.mint, self.creator, self.out = rpc, mint, creator, out
         self.snapshot_min, self.max_tx, self.wallet_scan_limit = snapshot_min, max_tx, wallet_scan_limit
         self.events, self.txs = [], {}
+        self.window_min, self.jsonl = window_min, list(jsonl)
+        self.tok_accounts = defaultdict(set)
+        self._hub_cache = {}
         self.infra = set(exclude)  # + wallets exclus (ex. wallet communautaire DAVID)
         self.facts = {"mint": mint, "creator_declared": creator, "warnings": []}
         os.makedirs(out, exist_ok=True)
@@ -62,19 +66,22 @@ class Investigation:
 
     # ------------------------------------------------------------------ 1
     def load_mint_history(self):
-        sigs = self.rpc.signatures(self.mint)
-        sigs = [s for s in sigs if s.get("err") is None]
-        sigs.sort(key=lambda s: (s.get("slot") or 0, s.get("blockTime") or 0))
-        self.facts["mint_signature_count"] = len(sigs)
-        if self.max_tx and len(sigs) > self.max_tx:
-            self.warn(f"{len(sigs)} signatures sur le mint ; seules les {self.max_tx} premières sont analysées "
-                      "(--max-tx). ATH/ventes tardives peuvent manquer.")
-            sigs = sigs[: self.max_tx]
-        for i, s in enumerate(sigs):
-            if i % 500 == 0:
-                print(f"  tx {i}/{len(sigs)}", file=sys.stderr)
-            self.txs[s["signature"]] = self.rpc.tx(s["signature"])
-        self.order = [s["signature"] for s in sigs if self.txs.get(s["signature"])]
+        """Toutes les tx du mint, de la création à création + window_min
+        (tri chronologique via Helius), ou depuis des fichiers JSONL."""
+        if self.jsonl:
+            txs = [json.loads(line) for p in self.jsonl for line in open(p)]
+        else:
+            first = self.rpc.txs_for_address(self.mint, limit_total=1)
+            t0 = first[0]["blockTime"]
+            txs = self.rpc.txs_for_address(self.mint, start=t0, end=t0 + self.window_min * 60, limit_total=self.max_tx)
+        txs = [t for t in txs if (t.get("meta") or {}).get("err") is None]
+        txs.sort(key=lambda t: (t["slot"], t.get("transactionIndex", 0)))
+        for t in txs:
+            self.txs[t["transaction"]["signatures"][0]] = t
+        self.order = list(self.txs)
+        self.facts["window_minutes"] = self.window_min
+        self.facts["window_tx_count"] = len(self.order)
+        self.window_end = txs[0]["blockTime"] + self.window_min * 60 if txs else None
 
     def supply(self):
         v = self.rpc.token_supply(self.mint)["value"]
@@ -82,6 +89,9 @@ class Investigation:
         self.supply_ui = int(v["amount"]) / 10 ** self.decimals
         self.facts["supply_current_ui"] = self.supply_ui
         self.facts["decimals"] = self.decimals
+        info = self.rpc.account_info(self.mint)
+        self.token_program = (info or {}).get("value", {}).get("owner") if info else None
+        self.facts["token_program"] = self.token_program
 
     # ------------------------------------------------------------------ 2
     def creation(self):
@@ -171,7 +181,12 @@ class Investigation:
     # ------------------------------------------------------------------ 4
     def build_events(self):
         for sig in self.order:
-            self.events.extend(parse_tx(self.txs[sig], self.mint, frozenset(self.infra)))
+            tx = self.txs[sig]
+            self.events.extend(parse_tx(tx, self.mint, frozenset(self.infra)))
+            keys = [k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"]]
+            for b in (tx["meta"].get("postTokenBalances") or []):
+                if b.get("mint") == self.mint and b.get("owner") and b["accountIndex"] < len(keys):
+                    self.tok_accounts[b["owner"]].add(keys[b["accountIndex"]])
         self.events.sort(key=lambda e: (e["slot"], e["block_time"] or 0))
         # Série de prix côté pool (lamports / unité brute -> SOL / token)
         self.price_t, self.price_v = [], []
@@ -208,7 +223,8 @@ class Investigation:
 
         for e in self.events:
             while mi < len(marks) and e["block_time"] > marks[mi]:
-                timeline.append(self._mark(TIMELINE_OFFSETS[mi], marks[mi], vol, holders()))
+                timeline.append(self._mark(TIMELINE_OFFSETS[mi], marks[mi], vol, holders(),
+                                           partial=bool(self.window_end and marks[mi] > self.window_end)))
                 mi += 1
             if snapshot is None and e["block_time"] > snap_t:
                 snapshot = dict(bal)
@@ -291,47 +307,74 @@ class Investigation:
         self.facts["multi_receiver_buy_txs"] = {s: sorted(o) for s, o in multi.items() if len(o) > 1}
 
     # ------------------------------------------------------------------ 7
+    def token_accounts_of(self, w):
+        accts = set(self.tok_accounts.get(w, ()))
+        try:
+            from solders.pubkey import Pubkey
+            ata = Pubkey.find_program_address(
+                [bytes(Pubkey.from_string(w)), bytes(Pubkey.from_string(self.token_program)), b58(self.mint)],
+                Pubkey.from_string(ATA_PROGRAM))[0]
+            accts.add(str(ata))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            accts |= {a["pubkey"] for a in self.rpc.token_accounts_by_owner(w, self.mint)["value"]}
+        except Exception:  # noqa: BLE001
+            pass
+        return sorted(accts)
+
     def wallet_deep_dive(self, wallets):
-        """Historique complet de chaque wallet clé : swaps + transferts du token
-        (y compris hors DEX), financement initial, destination des profits."""
+        """Pour chaque wallet clé : tous les mouvements du token (via ses comptes
+        de tokens : swaps sur tous DEX + transferts), financement initial,
+        financement juste avant le 1er achat, destination des SOL après ventes."""
         res = {}
         for w in wallets:
             print(f"  wallet {w}", file=sys.stderr)
-            sigs = self.rpc.signatures(w, limit_total=self.wallet_scan_limit)
-            truncated = len(sigs) >= self.wallet_scan_limit
-            sigs = [s for s in sigs if s.get("err") is None]
-            sigs.sort(key=lambda s: s.get("slot") or 0)
-            evs, sol_in, sol_out, created_other = [], [], [], []
-            first_activity = sigs[0] if sigs else None
-            for s in sigs:
-                tx = self.txs.get(s["signature"]) or self.rpc.tx(s["signature"])
-                if tx is None:
-                    continue
-                evs.extend(e for e in parse_tx(tx, self.mint, frozenset(self.infra)) if e["owner"] == w)
-                for src, dst, lam in sol_transfers(tx):
-                    if dst == w and src != w:
-                        sol_in.append({"from": src, "lamports": lam, "t": tx["blockTime"], "sig": s["signature"]})
-                    elif src == w and dst != w:
-                        sol_out.append({"to": dst, "lamports": lam, "t": tx["blockTime"], "sig": s["signature"]})
-                names = instruction_names(tx)
-                if any(n.lower().startswith("create") for n in names) and w in {
-                        k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"] if k.get("signer")}:
-                    if any(p.get("programId") == PUMP for p in tx["transaction"]["message"]["instructions"]):
-                        created_other.append(s["signature"])
-            evs.sort(key=lambda e: e["slot"])
+            seen, evs, truncated = set(), [], False
+            for acct in self.token_accounts_of(w):
+                txs = self.rpc.txs_for_address(acct, limit_total=self.wallet_scan_limit)
+                truncated |= len(txs) >= self.wallet_scan_limit
+                for tx in txs:
+                    sg = tx["transaction"]["signatures"][0]
+                    if sg in seen:
+                        continue
+                    seen.add(sg)
+                    evs.extend(e for e in parse_tx(tx, self.mint, frozenset(self.infra)) if e["owner"] == w)
+            evs.sort(key=lambda e: (e["slot"], e["block_time"] or 0))
             res[w] = self._pnl(w, evs)
             first_buy_t = next((e["block_time"] for e in evs if e["kind"].startswith("BUY")), None)
+            first_sell_t = next((e["block_time"] for e in evs if e["kind"] == "SELL"), None)
+            early = self.rpc.txs_for_address(w, limit_total=30)
+            before = self.rpc.txs_for_address(w, end=first_buy_t, order="desc", limit_total=40) if first_buy_t else []
+            after = self.rpc.txs_for_address(w, start=first_sell_t, limit_total=150) if first_sell_t else []
+
+            def flows(txs):
+                i, o = [], []
+                for tx in txs:
+                    sg = tx["transaction"]["signatures"][0]
+                    for src, dst, lam in sol_transfers(tx):
+                        if dst == w and src != w:
+                            i.append({"from": src, "lamports": lam, "t": tx["blockTime"], "sig": sg})
+                        elif src == w and dst != w:
+                            o.append({"to": dst, "lamports": lam, "t": tx["blockTime"], "sig": sg})
+                return i, o
+            ei, _ = flows(early)
+            bi, _ = flows(before)
+            _, ao = flows(after)
+            # on ignore les micro-transferts (frais, tips) pour les liens de profit
+            ao_big = [x for x in ao if x["lamports"] >= 0.05 * LAMPORTS]
             res[w]["history_truncated"] = truncated
-            res[w]["first_activity"] = ({"signature": first_activity["signature"],
-                                         "block_time": first_activity.get("blockTime")} if first_activity else None)
-            res[w]["funding_before_first_buy"] = [x for x in sol_in if first_buy_t is None or x["t"] <= first_buy_t][-10:]
-            res[w]["first_funding"] = sol_in[:5]
-            last_sell_t = max((e["block_time"] for e in evs if e["kind"] == "SELL"), default=None)
-            res[w]["sol_out_after_first_sell"] = [x for x in sol_out if last_sell_t and x["t"] >= min(
-                e["block_time"] for e in evs if e["kind"] == "SELL")][:30] if last_sell_t else []
-            res[w]["pump_creates_signed"] = created_other
-            res[w]["sol_in_all"] = sol_in
-            res[w]["sol_out_all"] = sol_out
+            res[w]["first_activity"] = ({"signature": early[0]["transaction"]["signatures"][0],
+                                         "block_time": early[0]["blockTime"]} if early else None)
+            res[w]["first_funding"] = ei[:5]
+            res[w]["funding_before_first_buy"] = sorted(bi, key=lambda x: x["t"])[-10:]
+            res[w]["sol_out_after_first_sell"] = ao_big[:40]
+            res[w]["sol_in_all"] = ei + bi
+            res[w]["sol_out_all"] = ao_big
+            res[w]["pump_creates_signed"] = [
+                tx["transaction"]["signatures"][0] for tx in early
+                if any(n.lower().startswith("create") for n in instruction_names(tx))
+                and any(k.get("signer") and k["pubkey"] == w for k in tx["transaction"]["message"]["accountKeys"])]
         return res
 
     def _pnl(self, w, evs):
@@ -361,8 +404,9 @@ class Investigation:
             "max_balance_ui": self.ui(self.max_bal.get(w, 0)),
             "max_pct_supply": 100 * self.ui(self.max_bal.get(w, 0)) / self.supply_ui,
             "balance_now_ui": live,
-            "events": [{k: e[k] for k in ("signature", "block_time", "kind", "token_raw", "sol_lamports",
-                                          "venues", "counterparties", "jito_tip")} for e in evs],
+            "n_priced_by_pool": sum(1 for e in evs if e.get("priced_by_pool")),
+            "events": [{k: e.get(k) for k in ("signature", "block_time", "kind", "token_raw", "sol_lamports",
+                                              "venues", "counterparties", "jito_tip", "priced_by_pool")} for e in evs],
         }
 
     def live_balance(self, w):
@@ -412,25 +456,35 @@ class Investigation:
                     acc[v] += sd[v]
                     hits[v] += 1
         claims = []
-        for s in self.rpc.signatures(self.creator, limit_total=self.wallet_scan_limit):
-            if s.get("err") is not None:
-                continue
-            tx = self.rpc.tx(s["signature"])
-            names = [n.lower() for n in instruction_names(tx or {})]
+        for tx in self.rpc.txs_for_address(self.creator, start=self.t0, limit_total=self.wallet_scan_limit):
+            names = [n.lower() for n in instruction_names(tx)]
             if any("collect" in n and "fee" in n for n in names):
                 sd = sol_deltas_by_owner(tx)
-                claims.append({"signature": s["signature"], "block_time": tx["blockTime"],
-                               "sol_received": sd.get(self.creator, 0) / LAMPORTS, "instructions": names})
+                claims.append({"signature": tx["transaction"]["signatures"][0], "block_time": tx["blockTime"],
+                               "sol_received": sd.get(self.creator, 0) / LAMPORTS,
+                               "vault_debits": {v: -sd.get(v, 0) / LAMPORTS for v in vaults if sd.get(v, 0) < 0},
+                               "instructions": [n for n in names if "fee" in n]})
         claims.sort(key=lambda c: c["block_time"])
+        unclaimed = {}
+        cv, psv = self.facts.get("pump_creator_vault"), self.facts.get("pumpswap_creator_vault_authority")
+        if cv:
+            unclaimed[cv] = max(0, self.rpc.balance(cv)["value"] - 890_880) / LAMPORTS  # moins le minimum de rente
+        if psv:
+            ws = self.rpc.token_accounts_by_owner(psv, WSOL)["value"]
+            unclaimed[psv] = sum(int(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]) for a in ws) / LAMPORTS
+        claimed = sum(c["sol_received"] for c in claims)
         self.facts["creator_fees"] = {
             "vaults": vaults,
-            "accrued_from_this_token_sol": {v: acc[v] / LAMPORTS for v in vaults},
-            "accrued_total_sol": sum(acc.values()) / LAMPORTS,
-            "trades_crediting_vault": dict(hits),
+            "accrued_in_window_sol": {v: acc[v] / LAMPORTS for v in vaults},
+            "accrued_in_window_total_sol": sum(acc.values()) / LAMPORTS,
+            "trades_crediting_vault_in_window": dict(hits),
             "claims": claims,
-            "claimed_total_sol": sum(c["sol_received"] for c in claims),
-            "note": ("Les claims couvrent TOUS les tokens du créateur (vault partagé) ; "
-                     "accrued_total_sol est la part attribuable à ce mint."),
+            "claimed_total_sol": claimed,
+            "unclaimed_now_sol": unclaimed,
+            "lifetime_total_sol": claimed + sum(unclaimed.values()),
+            "accrued_total_sol": claimed + sum(unclaimed.values()),
+            "note": ("lifetime = claims reçus + solde non réclamé des vaults. Les vaults sont communs à tous les "
+                     "tokens du créateur : valable pour ce seul token si le créateur n'en a pas lancé d'autres."),
         }
         if not sum(hits.values()):
             self.warn("Aucun crédit vers les vaults créateur dérivés : fee sharing / changement de "
@@ -450,11 +504,11 @@ class Investigation:
             if len(ws) < 2:
                 continue
             try:
-                n = len({t for s in self.rpc.signatures(f, limit_total=300)
-                         for (src, t, _) in sol_transfers(self.rpc.tx(s["signature"])) if src == f})
+                n = len({t for tx in self.rpc.txs_for_address(f, order="desc", limit_total=150)
+                         for (src, t, _) in sol_transfers(tx) if src == f})
             except Exception:  # noqa: BLE001
                 n = 0
-            if n >= HUB_THRESHOLD:
+            if n >= HUB_THRESHOLD or self._is_hub(f):
                 hubs.add(f)
         edges = []
         for f, ws in funder_of.items():
@@ -478,11 +532,15 @@ class Investigation:
                 if c in wallets and c != w:
                     edges.append({"a": c, "b": w, "type": "achat_payé_par_autre_ou_transfert", "via": None,
                                   "strength": "FAIT (lien)"})
-        # destinations communes des profits
+        # destinations communes des profits (hors pools/curve, hors hubs)
         dest = defaultdict(set)
         for w, d in deep.items():
             for x in d["sol_out_after_first_sell"]:
-                dest[x["to"]].add(w)
+                if x["to"] not in self.infra and x["to"] not in wallets:
+                    dest[x["to"]].add(w)
+        for t, ws in list(dest.items()):
+            if len(ws) >= 2 and self._is_hub(t):
+                hubs.add(t)
         for t, ws in dest.items():
             if len(ws) >= 2 and t not in hubs:
                 ws = sorted(ws)
@@ -514,6 +572,21 @@ class Investigation:
         self.facts["hubs_excluded"] = sorted(hubs)
         self.facts["clusters"] = [sorted(g) for g in groups.values() if len(g) > 1]
         self.facts["creator_cluster"] = sorted(groups[find(self.creator)]) if self.creator in parent else [self.creator]
+
+    def _is_hub(self, addr):
+        """Adresse très active recevant de nombreux expéditeurs distincts
+        (CEX, routeur, programme) : ne doit pas créer de lien."""
+        if addr in self._hub_cache:
+            return self._hub_cache[addr]
+        try:
+            txs = self.rpc.txs_for_address(addr, order="desc", limit_total=150)
+            senders = {s for tx in txs for (s, d, _) in sol_transfers(tx) if d == addr}
+            dests = {d for tx in txs for (s, d, _) in sol_transfers(tx) if s == addr}
+            hub = len(senders) >= HUB_THRESHOLD or len(dests) >= HUB_THRESHOLD
+        except Exception:  # noqa: BLE001
+            hub = False
+        self._hub_cache[addr] = hub
+        return hub
 
     # ------------------------------------------------------------------ 11
     def hypothesis(self, deep, pool, fee_bps):
@@ -645,12 +718,15 @@ def main():
     ap.add_argument("--snapshot-min", type=float, default=38)
     ap.add_argument("--max-tx", type=int, default=None)
     ap.add_argument("--wallet-scan-limit", type=int, default=3000)
+    ap.add_argument("--window-min", type=float, default=60, help="fenêtre (min après création) téléchargée en entier")
+    ap.add_argument("--jsonl", nargs="*", default=[], help="tx du mint déjà téléchargées (fetch_window.py)")
     ap.add_argument("--exclude", nargs="*", default=[], help="wallets à traiter comme infrastructure (ex. wallet communautaire/airdrop)")
     ap.add_argument("--pool-fee-bps", type=float, default=30, help="ESTIMATION des frais du pool pour la valeur de liquidation")
     a = ap.parse_args()
     creator = a.creator or (JEANPHIL_CREATOR if a.mint == JEANPHIL_MINT else None)
     rpc = Rpc(cache_dir=os.path.join(a.out, "cache"))
-    Investigation(rpc, a.mint, creator, a.out, a.snapshot_min, a.max_tx, a.wallet_scan_limit, a.exclude).run(a.pool_fee_bps)
+    Investigation(rpc, a.mint, creator, a.out, a.snapshot_min, a.max_tx, a.wallet_scan_limit, a.exclude,
+                  a.window_min, a.jsonl).run(a.pool_fee_bps)
 
 
 if __name__ == "__main__":

@@ -92,6 +92,18 @@ class FakeRpc:
     def tx(self, s):
         return self.b.txs.get(s)
 
+    def txs_for_address(self, address, start=None, end=None, order="asc", limit_total=None, token_accounts=False):
+        sigs = sorted(self._involving(address), key=lambda x: x["slot"], reverse=(order == "desc"))
+        out = [self.b.txs[s["signature"]] for s in sigs
+               if (start is None or s["blockTime"] >= start) and (end is None or s["blockTime"] <= end)]
+        return out[:limit_total] if limit_total else out
+
+    def account_info(self, address):
+        return {"value": {"owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"}}
+
+    def balance(self, address):
+        return {"value": 890_880 + (int(0.2 * SOL) if address == VAULT else 0)}
+
     def token_supply(self, mint):
         return {"value": {"amount": str(self.supply_raw), "decimals": DEC}}
 
@@ -106,7 +118,7 @@ class FakeRpc:
                         bal += int(post["uiTokenAmount"]["amount"]) - int(pre["uiTokenAmount"]["amount"])
             if owner == POOL:
                 bal = 200_000_000 * U
-        return {"value": [{"account": {"data": {"parsed": {"info": {"tokenAmount": {"amount": str(max(bal, 0))}}}}}}]}
+        return {"value": [{"pubkey": owner, "account": {"data": {"parsed": {"info": {"tokenAmount": {"amount": str(max(bal, 0))}}}}}}]}
 
 
 def scenario():

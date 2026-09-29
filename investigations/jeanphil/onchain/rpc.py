@@ -104,7 +104,7 @@ class Rpc:
     def tx(self, signature):
         return self.call(
             "getTransaction",
-            [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}],
+            [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}],
             cacheable=True,
         )
 
@@ -119,3 +119,34 @@ class Rpc:
 
     def balance(self, address):
         return self.call("getBalance", [address])
+
+    def txs_for_address(self, address, start=None, end=None, order="asc", limit_total=None, token_accounts=False):
+        """Transactions complètes d'une adresse via la méthode Helius
+        getTransactionsForAddress (tri chronologique, filtres temporels).
+        Nécessite un RPC Helius."""
+        out, tok = [], None
+        while True:
+            filt = {"status": "succeeded"}
+            bt = {}
+            if start is not None:
+                bt["gte"] = int(start)
+            if end is not None:
+                bt["lte"] = int(end)
+            if bt:
+                filt["blockTime"] = bt
+            if token_accounts:
+                filt["tokenAccounts"] = "balanceChanged"
+            page = 100 if not limit_total else max(1, min(100, limit_total - len(out)))
+            o = {"transactionDetails": "full", "sortOrder": order, "limit": page, "encoding": "jsonParsed",
+                 "maxSupportedTransactionVersion": 1, "filters": filt}
+            if tok:
+                o["paginationToken"] = tok
+            res = self.call("getTransactionsForAddress", [address, o], cacheable=True)
+            data = res.get("data") or []
+            out.extend(data)
+            tok = res.get("paginationToken")
+            if not tok or not data or (limit_total and len(out) >= limit_total):
+                return out
+
+    def account_info(self, address):
+        return self.call("getAccountInfo", [address, {"encoding": "jsonParsed"}])
