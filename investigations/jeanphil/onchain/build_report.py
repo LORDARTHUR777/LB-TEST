@@ -158,6 +158,129 @@ def main():
       "n'a été trouvé entre le créateur et ces wallets** (voir §6), et plusieurs d'entre eux appartiennent à des groupes "
       "distincts. L'hypothèse est donc présentée uniquement comme un calcul.\n")
 
+    # --------------------------------------------------------------- setup
+    su = F.get("setup") or {}
+    tr = F.get("creator_trail") or {}
+    if su:
+        md = su.get("metadata") or {}
+        off = su.get("offchain_metadata") or {}
+        jup = su.get("jupiter") or {}
+        dsi = su.get("dexscreener_info") or {}
+        p("## Ce que le créateur a mis en place, dans l'ordre (réglages, coûts, référencement, gains)\n")
+        p("### A. Réglages du memecoin (FAIT, lus sur le compte du mint)\n")
+        p("| Réglage | Valeur | Ce que ça implique |")
+        p("|---|---|---|")
+        p(f"| Plateforme | Pump.fun (programme `6EF8…F6P`, instruction `CreateV2`) | lancement « fair launch » sur bonding curve, graduation automatique |")
+        p(f"| Nom / ticker | {md.get('name')} / {md.get('symbol')} | |")
+        p(f"| Description | « {off.get('description', 'n/d').strip()} » | |")
+        p(f"| Site déclaré dans les métadonnées | {off.get('website', 'n/d')} | aucun X/Telegram dans les métadonnées on-chain |")
+        p(f"| Image | IPFS `{(off.get('image') or '').split('/')[-1][:20]}…` | |")
+        p(f"| Standard | Token-2022 (`{su.get('token_program', '')[:6]}…`), {su.get('decimals')} décimales, supply initiale 1 000 000 000 | |")
+        p(f"| Mint authority | {su.get('mint_authority') or '**désactivée**'} | impossible de créer de nouveaux tokens |")
+        p(f"| Freeze authority | {su.get('freeze_authority') or '**désactivée**'} | impossible de geler un wallet |")
+        p(f"| Update authority des métadonnées | {md.get('updateAuthority') or '**aucune**'} | nom/logo/lien non modifiables |")
+        p(f"| Dev buy | {mtok(c['dev_buy_tokens_ui'])} ({n(c['dev_buy_tokens_ui'] / SUPPLY0 * 100, 2)} %) | seul achat du créateur, jamais revendu |")
+        p("| Destinataire des creator fees | le créateur lui-même (vaults PDA dérivés de son adresse) | aucun partage de fees configuré par lui sur JEANPHIL |")
+        a_ = jup.get("audit") or {}
+        p(f"| Contrôle Jupiter | mint/freeze désactivés : {a_.get('mintAuthorityDisabled')}/{a_.get('freezeAuthorityDisabled')} ; "
+          f"dev = {n(a_.get('devBalancePercentage'), 2)} % ; tokens créés par ce dev : {a_.get('devMints')} ; "
+          f"score organique {n(jup.get('organicScore'), 0)}/100 ({jup.get('organicScoreLabel')}) ; tags {jup.get('tags')} | source : API Jupiter |")
+        p("")
+        p("### B. Coût du lancement — où est parti chaque lamport (FAIT)\n")
+        p(f"Transaction {s(c['signature'])}, signée depuis le wallet créateur sur **pump.fun**. Total débité : "
+          f"**{n(-c['launch_total_sol_delta'], 6)} SOL ≈ {usd(-c['launch_total_sol_delta'] * (px(t0) or 0))}** (SOL ≈ {n(px(t0), 2)} $).\n")
+        p("| Destination | SOL | Nature (INDICE sauf mention) |")
+        p("|---|---|---|")
+        lab = {F["bonding_curve"]: "bonding curve : paiement du dev buy + rente du compte (FAIT)",
+               F["mint"]: "rente du compte mint (dépôt récupérable seulement si fermé)",
+               cf["vaults"][0]: "creator fee du dev buy → son propre vault (lui revient, FAIT)"}
+        for k, v in su.get("creation_cost_breakdown", []):
+            p(f"| {a(k)} | {n(v, 6)} | {lab.get(k, 'frais de protocole Pump.fun ou rente de comptes de tokens')} |")
+        p(f"| frais réseau Solana | {n(su.get('creation_network_fee'), 6)} | FAIT |")
+        p("\nAucune autre dépense du wallet créateur n'apparaît on-chain : pas de paiement en SOL/USDC vers DexScreener, "
+          "un market maker ou un service de bump/volume depuis ce wallet.\n")
+        p("### C. Référencement du token, dans l'ordre\n")
+        p("| Date (UTC) | Où | Comment | Coût / payeur | Source |")
+        p("|---|---|---|---|---|")
+        ref = []
+        p_ = p
+        p = lambda line, t=t0: ref.append((t, line))  # noqa: E731
+        p(f"| {ts(t0)} | **Pump.fun** | création par le créateur | {n(-c['launch_total_sol_delta'], 3)} SOL (ci-dessus) | FAIT on-chain |")
+        p(f"| {ts(g['block_time'])} | **PumpSwap** (pool {a(g['pool_owner'])}) | graduation automatique | 0 pour le créateur | FAIT on-chain |", g["block_time"])
+        if M:
+            for pa, pl in sorted(M["pools"].items(), key=lambda kv: kv[1]["created"]):
+                if pa == g["pool_owner"]:
+                    continue
+                p(f"| {ts(pl['created'])} | {pl['dex'].capitalize()} (pool {a(pa)}) | pool créé par un tiers | pas le créateur | DexScreener |", pl["created"])
+        for o in (su.get("dexscreener_orders") or {}).get("orders", []):
+            p(f"| {ts(o['paymentTimestamp'] // 1000)} | **DexScreener** — « {o['type']} » ({o['status']}) | profil enrichi : logo, bannière, "
+              f"liens {', '.join(x['type'] for x in dsi.get('socials', []))} | tarif public ≈ 299 $ (ESTIMATION) ; **payeur non identifié** "
+              "— aucune sortie du wallet créateur ce jour-là | API DexScreener |", o["paymentTimestamp"] // 1000)
+        p(f"| automatique | GeckoTerminal, Jupiter, Birdeye, Phantom… | indexation automatique des pools | 0 | APIs |", 9e18)
+        p(f"| — | CoinGecko | **non listé** (`coingecko_coin_id` = null) | — | API GeckoTerminal |", 9e18)
+        p("| après le 20/09 | Pages de prix / articles : Coinbase (page de prix), CryptoRank, CoinCodex, OpenSea, KuCoin News, Bitrue, "
+          "KCEX, OneBullEx ; site d'airdrop jean-philanthrope.com | pages éditoriales ou agrégateurs — pas des listings d'exchange payés | n/d | SOURCE TIERCE (recherche web) |", 9e18)
+        p = p_
+        for _, line in sorted(ref, key=lambda x: x[0]):
+            p(line)
+        socials = ", ".join(f"[{x['type']}]({x['url']})" for x in dsi.get("socials", []))
+        p(f"\nRéseaux affichés sur le profil DexScreener : {socials}. Le compte X a publié le contrat comme « seul token officiel » "
+          "(SOURCE TIERCE : post X).\n")
+        p("### D. Toutes les actions signées par le créateur (FAIT)\n")
+        p("| Date (UTC) | Action | SOL pour lui | Transaction |")
+        p("|---|---|---|---|")
+        arows = []
+        p_ = p
+        p = lambda line, t=0: arows.append((t, line))  # noqa: E731
+        acts = su.get("creator_signed_actions", [])
+        dist_batch = [x for x in acts if any(i.startswith("DistributeCreatorFees") for i in x["instructions"])]
+        for x in sorted(acts, key=lambda x: x["t"]):
+            if x in dist_batch:
+                continue
+            ins = x["instructions"]
+            if "CreateV2" in ins:
+                what = "Création du token + dev buy (pump.fun)"
+            elif any("Collect" in i for i in ins):
+                what = "Retrait (claim) des creator fees JEANPHIL"
+            elif not ins and x["sol_delta"] < 0:
+                what = "Envoi de SOL vers " + next((a(o["to"]) for o in tr.get("sol_outflows", []) if o["sig"] == x["sig"]), "?")
+            elif not ins and x["sol_delta"] > 0:
+                what = "Fermeture d'un compte de token reçu en airdrop (rente récupérée)"
+            else:
+                what = ", ".join(ins) or "transaction technique"
+            p(f"| {ts(x['t'])} | {what} | {n(x['sol_delta'], 4)} | {s(x['sig'])} |", x["t"])
+        if dist_batch:
+            p(f"| {ts(min(x['t'] for x in dist_batch))} | {len(dist_batch)} × `DistributeCreatorFees` : encaisse des parts de fees "
+              f"d'**autres** tokens qui l'ont désigné bénéficiaire | {n(sum(x['sol_delta'] for x in dist_batch), 4)} | — |", min(x["t"] for x in dist_batch))
+        claim_crank = [cl for cl in cf["claims"] if cl["signature"] not in {x["sig"] for x in acts}]
+        for cl in claim_crank:
+            p(f"| {ts(cl['block_time'])} | Claim déclenché par un tiers (instruction sans permission), fees versées au créateur | "
+              f"{n(cl['sol_received'], 4)} | {s(cl['signature'])} |", cl["block_time"])
+        p = p_
+        for _, line in sorted(arows, key=lambda x: x[0]):
+            p(line)
+        pas = su.get("creator_passive") or {}
+        p(f"\nReçu passivement (non signé par lui) : {pas.get('airdrops_other_tokens')} transactions d'airdrop d'autres memecoins "
+          f"et {pas.get('fee_sharing_configs_by_third_parties')} configurations de partage de fees créées par des tiers sur d'autres tokens. "
+          "Il n'a acheté ou vendu aucun autre token.\n")
+        p("### E. Bilan financier du créateur (FAIT, $ = ESTIMATION)\n")
+        un = sum(cf["unclaimed_now_sol"].values())
+        outs = [x for x in tr.get("sol_outflows", []) if x["sig"] != c["signature"]]
+        p("| Poste | SOL | ≈ USD |")
+        p("|---|---|---|")
+        p(f"| Mis de sa poche (création + dev buy) | −{n(-c['launch_total_sol_delta'], 3)} | −{usd(-c['launch_total_sol_delta'] * (px(t0) or 0))} |")
+        p(f"| Ventes de JEANPHIL | 0 | 0 $ |")
+        p(f"| Creator fees JEANPHIL réclamées | +{n(cf['claimed_total_sol'], 2)} | +{usd(fees_usd)} |")
+        p(f"| Creator fees non réclamées | +{n(un, 2)} | +{usd(un * (sol_now or 0))} |")
+        p(f"| Parts de fees d'autres tokens (`DistributeCreatorFees`) | +{n(tr.get('distribute_creator_fees_income_sol'), 2)} | ≈ +{usd((tr.get('distribute_creator_fees_income_sol') or 0) * (sol_now or 0))} |")
+        p(f"| **Gain réalisé** | **+{n(cf['claimed_total_sol'] + (tr.get('distribute_creator_fees_income_sol') or 0) + c['launch_total_sol_delta'], 2)}** | "
+          f"**≈ +{usd(fees_usd + (tr.get('distribute_creator_fees_income_sol') or 0) * (sol_now or 0) + c['launch_total_sol_delta'] * (px(t0) or 0))}** |")
+        p(f"| dont déjà sorti vers un service (exchange probable) | {n(sum(x['sol'] for x in outs), 2)} | {usd(sum(x['sol'] * (px(x['t']) or 0) for x in outs))} |")
+        p(f"| resté sur le wallet créateur | {n(tr.get('creator_balance_now_sol'), 2)} | {usd((tr.get('creator_balance_now_sol') or 0) * (sol_now or 0))} |")
+        p(f"| **Encore en tokens** (non vendus) | {mtok(cr['balance_now_ui'])} JEANPHIL | ≈ {usd((cr_pos_spot_sol or 0) * (sol_now or 0))} au prix spot ; "
+          f"≈ {usd((cr_pos_liq_sol or 0) * (sol_now or 0))} si vendus d'un bloc (ESTIMATION) |")
+        p("")
+
     # --------------------------------------------------------------- timeline
     p("## 1. Timeline chronologique\n")
     ev = []
@@ -475,6 +598,19 @@ def main():
         p("- Le « wallet communautaire de 50 % » annoncé correspond donc, on-chain, au **dev buy du wallet créateur**, "
           "vendu en une transaction — il n'a pas été conservé ni distribué depuis ce wallet.")
         p(f"- Creator fees réclamées : **{n(dcf['claimed_total_sol'], 2)} SOL** (≈ {usd(dfees_usd)}).")
+        dcre = dc["signers"][0]
+        for w in D.get("creator_cluster", []):
+            if w == dcre:
+                continue
+            dw = DW.get(w, {})
+            vias = sorted({e["via"] for e in D["link_edges"] if {e["a"], e["b"]} == {w, dcre}})
+            rank = next((r["rank"] for r in D["snapshot"]["top20"] if r["owner"] == w), None)
+            p(f"- **INDICE fort de wallet lié au créateur DAVID** : {a(w)} (n°{rank} au snapshot +{D['snapshot']['minutes_after_creation']:.0f} min) "
+              f"achète {mtok(dw.get('tokens_bought'))} pour {n(dw.get('sol_invested'), 2)} SOL "
+              f"{dur((dw.get('first_time') or 0) - dc['block_time'])} après la création, revend tout pour **{n(dw.get('sol_recovered'), 2)} SOL**, "
+              f"puis envoie ses profits vers {', '.join(a(v) for v in vias)} — **la même adresse** qui reçoit les SOL du créateur. "
+              "Cette adresse n'a que quelques expéditeurs (wallet personnel, pas un exchange). Non prouvé, mais cohérent avec "
+              "un créateur qui snipe son propre lancement avec un second wallet.")
         if D.get("graduation"):
             p(f"- Graduation : +{dur(D['graduation']['block_time'] - dc['block_time'])} après création.")
         if DM:
@@ -487,7 +623,7 @@ def main():
         p("|---|---|---|")
         jv = sum(pl["volume_usd_total"] for pl in M["pools"].values()) if M else None
         dv = sum(pl["volume_usd_total"] for pl in DM["pools"].values()) if DM else None
-        rows = [
+        drows = [
             ("Capital initial du créateur (dev buy)", f"{n(c['dev_buy_sol'], 2)} SOL ≈ {usd(cr_in_usd)}", f"{n(dc['dev_buy_sol'], 2)} SOL ≈ {usd(usd_of_events(dcr['events'], dpx, -1))}"),
             ("Dev buy (% supply)", f"{n(c['dev_buy_tokens_ui'] / SUPPLY0 * 100, 2)} %", f"{n(dc['dev_buy_tokens_ui'] / SUPPLY0 * 100, 2)} %"),
             ("Ventes du créateur", "aucune", f"100 % à +{dur(dsell[0]['block_time'] - dc['block_time'])}" if dsell else "n/d"),
@@ -507,7 +643,7 @@ def main():
             ("Holders actuels", n(M.get("holders_now"), 0) if M else "n/d", n(DM.get("holders_now"), 0) if DM else "n/d"),
             ("Creator fees réclamées", f"{n(cf['claimed_total_sol'], 1)} SOL ≈ {usd(fees_usd)}", f"{n(dcf['claimed_total_sol'], 1)} SOL ≈ {usd(dfees_usd)}"),
         ]
-        for k, x, y in rows:
+        for k, x, y in drows:
             p(f"| {k} | {x} | {y} |")
         p("\n**Pourquoi JEANPHIL a eu beaucoup plus de traction — lecture quantitative :**\n")
         p(f"1. **Offre flottante** : JEANPHIL a démarré avec un dev buy de 1,4 % jamais vendu ; DAVID avec 50 % concentrés dans un "

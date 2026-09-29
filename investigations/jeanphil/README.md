@@ -5,6 +5,7 @@ Créateur déclaré : `BS3FxZoEnDjt76iR3WhEkQZhLqLARVCDFu4dc4Z9dE3B`
 Comparaison : $DAVID `8wtdds5LPt7nu4jKifGpcxysF5AvJ1xCVti2rQ6Ppump`
 
 - `RAPPORT.md` : rapport forensique complet, généré depuis les données on-chain.
+- `results/` : données de résultat compressées (`facts.json.gz`, `market.json.gz`) pour JEANPHIL et DAVID.
 - `onchain/` : outil de reconstruction forensique. Il lit les transactions via le RPC Solana et génère le rapport chiffré.
 
 ## Statut
