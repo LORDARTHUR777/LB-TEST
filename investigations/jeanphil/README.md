@@ -4,43 +4,40 @@ Mint analysé (et uniquement celui-ci) : `GTBxUiw6wJdmmkCGZgRHLyYxqu1vG4KtRpeox6
 Créateur déclaré : `BS3FxZoEnDjt76iR3WhEkQZhLqLARVCDFu4dc4Z9dE3B`
 Comparaison : $DAVID `8wtdds5LPt7nu4jKifGpcxysF5AvJ1xCVti2rQ6Ppump`
 
-- `RAPPORT.md` : état actuel de l'investigation. Il sépare ce qui est vérifié de ce qui ne l'est pas.
+- `RAPPORT.md` : rapport forensique complet, généré depuis les données on-chain.
 - `onchain/` : outil de reconstruction forensique. Il lit les transactions via le RPC Solana et génère le rapport chiffré.
 
-## Pourquoi l'outil n'a pas encore tourné
+## Statut
 
-La politique réseau de l'environnement cloud où ce travail a été fait bloque ces hôtes (403 au niveau du proxy) :
-`api.mainnet-beta.solana.com`, `mainnet.helius-rpc.com`, `solscan.io`, `pump.fun`,
-`api.dexscreener.com`, `www.geckoterminal.com`, `public-api.birdeye.so`, `api.binance.com`.
-Seule la recherche web a fonctionné. `RAPPORT.md` ne contient donc aucun chiffre on-chain vérifié par nous.
+La reconstruction a été exécutée le 29/09/2026 avec un RPC Helius. Le rapport qui en résulte est `RAPPORT.md`.
+Les annexes `early_buyers.csv` et `wallets_pnl.csv` accompagnent le rapport. Les données brutes (`data/`,
+plusieurs centaines de Mo) ne sont pas versionnées.
 
-## Lancer la reconstruction
+## Relancer
 
-Il faut Python ≥ 3.10, `pip install solders` (utilisé pour dériver les PDA Pump.fun) et un RPC Solana
-avec historique complet. Un RPC gratuit Helius ou Triton convient ; le RPC public limite fortement le débit.
+Prérequis : Python ≥ 3.10, `pip install solders`, et une clé Helius (l'offre gratuite suffit). L'outil utilise
+la méthode Helius `getTransactionsForAddress`, qui lit l'historique dans l'ordre chronologique.
 
 ```bash
 cd investigations/jeanphil/onchain
 export SOLANA_RPC_URL="https://mainnet.helius-rpc.com/?api-key=VOTRE_CLE"
 
-python3 investigate.py --out ../data/jeanphil            # JEANPHIL (créateur pré-rempli)
+# 1. JEANPHIL : première heure complète + wallets clés
+python3 fetch_window.py GTBxUiw6wJdmmkCGZgRHLyYxqu1vG4KtRpeox6yDpump 1789841756 1789845356 ../data/jeanphil/mint_0_60.jsonl
+python3 market.py GTBxUiw6wJdmmkCGZgRHLyYxqu1vG4KtRpeox6yDpump 1789841756 ../data/jeanphil
+python3 investigate.py --out ../data/jeanphil --jsonl ../data/jeanphil/mint_0_60.jsonl --window-min 60 \
+    --exclude $(python3 -c "import json;print(' '.join(json.load(open('../data/jeanphil/market.json'))['pools']))")
+python3 creator_trail.py ../data/jeanphil
+
+# 2. DAVID : 9 premières minutes (le lancement a été très actif)
+python3 market.py 8wtdds5LPt7nu4jKifGpcxysF5AvJ1xCVti2rQ6Ppump 1785615803 ../data/david
 python3 investigate.py --mint 8wtdds5LPt7nu4jKifGpcxysF5AvJ1xCVti2rQ6Ppump --out ../data/david \
-    --exclude <WALLET_COMMUNAUTAIRE_DAVID>                # à identifier : le wallet public 50 %
+    --window-min 9 --snapshot-min 5 --exclude 5GNm6anmF9cFvhiSWrKLuSMTQJxvMex1KLvno9bBqZok
 
-# Prix SOL/USD horaire (CSV "unix_time,price") : optionnel. Sans lui, tout reste en SOL.
-python3 report.py --data ../data/jeanphil --sol-usd-csv sol_usd.csv > ../RAPPORT_ONCHAIN.md
-python3 compare.py ../data/jeanphil ../data/david >> ../RAPPORT_ONCHAIN.md
-
-python3 -m unittest discover -s tests -v                 # test hors-ligne (faux RPC)
+# 3. Rapport
+python3 build_report.py ../data/jeanphil ../data/david > ../RAPPORT.md
+python3 -m unittest discover -s tests -v
 ```
-
-Le cache disque (`data/*/cache`) garde chaque transaction déjà lue, donc une relance ne re-télécharge rien.
-Options utiles :
-
-- `--snapshot-min 38` : instant du snapshot du top 10.
-- `--max-tx N` : borne le nombre de transactions du mint analysées.
-- `--wallet-scan-limit` : profondeur d'historique par wallet.
-- `--pool-fee-bps` : frais du pool pour la valeur de liquidation. C'est une ESTIMATION, à vérifier.
 
 ## Méthode
 
@@ -58,9 +55,11 @@ Options utiles :
    - INDICE fort : funder commun, destination commune des profits.
    - INDICE faible : même slot.
    Les funders ayant financé ≥ 40 wallets (CEX, services) sont exclus. Seuls les liens FAIT / INDICE fort forment des clusters.
-6. **Creator fees.** Somme des crédits aux vaults créateur (PDA Pump.fun `creator-vault` et PumpSwap
-   `creator_vault`) dans les trades de ce mint. C'est la mesure réelle, sans barème supposé. Les claims signés
-   par le créateur sont listés à part : le vault Pump.fun est commun à tous les tokens d'un même créateur.
-7. **P&L.** Réalisé = SOL récupérés − SOL investis (flux réels, frais réseau inclus). Le latent est donné deux fois :
+6. **Creator fees.** Deux mesures, sans barème supposé :
+   - les SOL reçus par le créateur lors des claims, plus le solde non réclamé des vaults (PDA Pump.fun
+     `creator-vault` et PumpSwap `creator_vault`) ;
+   - en contrôle, les crédits aux vaults trade par trade sur la fenêtre complète.
+7. **P&L.** Réalisé = SOL récupérés − SOL investis (flux réels, frais réseau inclus). Certains swaps n'ont pas de
+   SOL côté wallet (paiement en USDC, routeur) : ils sont valorisés au prix d'exécution du pool (ESTIMATION). Le latent est donné deux fois :
    valeur spot, et valeur de liquidation avec slippage x·y=k sur les réserves actuelles du pool.
 8. **Hypothèse top 10 = créateur.** Calcul séparé, étiqueté HYPOTHÈSE. Les transferts internes au groupe sont neutralisés.
